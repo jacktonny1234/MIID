@@ -205,6 +205,69 @@ async def query_parse_worker():
     log.info("🔧 Query parse worker stopped")
 
 
+def _load_nonlatin_module():
+    """Dynamically load non-latin parser module based on versions.json."""
+    try:
+        strategy_path = Path(os.path.dirname(__file__), "versions.json")
+        version = "v1"
+        if strategy_path.exists():
+            with open(strategy_path, 'r') as f:
+                strategy_data = json.load(f)
+                version = strategy_data.get("versions", {"nonlatin_parser": strategy_data.get("version", "v1")}).get("nonlatin_parser", "v1")
+        ver = str(version).lstrip("_")
+        if not ver.startswith("v"):
+            ver = "v" + ver
+        modname = f"MIID.miner.nonlatin_parser_{ver}"
+        import importlib
+        module = importlib.import_module(modname)
+        importlib.reload(module)
+        return module
+    except Exception as e:
+        # Fallback to v1 if anything goes wrong
+        bt.logging.error(f"Error loading non-latin parser module: {e}")
+        try:
+            from MIID.miner import nonlatin_parser_v1 as module  # type: ignore
+            return module
+        except Exception:
+            return None
+
+
+def is_latin_name(name: str) -> bool:
+    """Versioned wrapper for latin-script detection."""
+    module = _load_nonlatin_module()
+    if module and hasattr(module, "is_latin_name"):
+        try:
+            return bool(module.is_latin_name(name))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    # Fallback: ASCII-only heuristic
+    try:
+        return name.isascii()
+    except Exception:
+        return True
+
+async def get_transliteration(name: str) -> str:
+    """Versioned wrapper for transliteration of a single name. Returns input if no transliterator available."""
+    module = _load_nonlatin_module()
+    if not module:
+        return name
+    # Prefer common function names if provided by the module
+    translit_fn = None
+    for fn_name in ("transliterate_to_latin",):
+        if hasattr(module, fn_name):
+            translit_fn = getattr(module, fn_name)
+            break
+    if not translit_fn:
+        return name
+    try:
+        result = translit_fn(name)
+        if asyncio.iscoroutine(result):
+            return await result
+        return str(result)
+    except Exception:
+        return name
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan manager"""
@@ -488,12 +551,13 @@ class AnswerCandidateForNoisy:
                 noisy_plan, noisy_count = kth_plan(len(self.answer_candidates), max(0, self.serial - COLLUSION_GROUP_SIZE_THRESHOLD) + 1)
                 for i,cand in enumerate(self.answer_candidates):
                     answer[cand.name] = cand.get_next_answer(noisy_plan[i])
-                metrics, penalty = self.calc_reward_and_penalty(self.answer_list + [answer], self.miner_list + [miner_uid])
-                if not penalty:
-                    self.answer_list.append(answer)
-                    self.miner_list.append(miner_uid)
-                    self.metrics = metrics
+                # metrics, penalty = self.calc_reward_and_penalty(self.answer_list + [answer], self.miner_list + [miner_uid])
+                # if not penalty:
+                #     self.answer_list.append(answer)
+                #     self.miner_list.append(miner_uid)
+                #     self.metrics = metrics
                     break
+            metrics = [{}]
             with open(f_serial, "w") as f:
                 f.write(str(self.serial))
             if try_count < 0:
@@ -526,9 +590,9 @@ def save_result(answer_candidate: AnswerCandidateForNoisy, miner_uid: int):
     os.makedirs(run_dir, exist_ok=True)
 
     try:
-        with open(os.path.join(run_dir, f"serial_{answer_candidate.serial:02d}-miner_{miner_uid}.json"), 'w', encoding="utf-8") as f:
-            output_json = answer_candidate.metrics[-1]
-            json.dump(output_json, f, indent=4)
+        # with open(os.path.join(run_dir, f"serial_{answer_candidate.serial:02d}-miner_{miner_uid}.json"), 'w', encoding="utf-8") as f:
+        #     output_json = answer_candidate.metrics[-1]
+        #     json.dump(output_json, f, indent=4)
 
         with open(os.path.join(run_dir, f"_task.json"), 'w', encoding="utf-8") as f:
             json.dump(
@@ -544,25 +608,25 @@ def save_result(answer_candidate: AnswerCandidateForNoisy, miner_uid: int):
         phonetic_score = {}
         orthographic_score = {}
         nonrule_count = {}
-        for name in metrics['name_metrics']:
-            name_metrics = metrics['name_metrics'][name]
-            for sub_name in [f"first_name", "last_name"]:
-                sub_count_matrix = [[0 for _ in range(8)] for _ in range(4)]
-                sub_name_data = name_metrics.get(sub_name, [])
-                if sub_name_data:
-                    variation_scores = sub_name_data['metrics'].get('variations', [])
-                    for variation in variation_scores:
-                        from MIID.miner.pool_generator import orth_level, orth_sim, phon_class, seed_codes
+        # for name in metrics['name_metrics']:
+        #     name_metrics = metrics['name_metrics'][name]
+        #     for sub_name in [f"first_name", "last_name"]:
+        #         sub_count_matrix = [[0 for _ in range(8)] for _ in range(4)]
+        #         sub_name_data = name_metrics.get(sub_name, [])
+        #         if sub_name_data:
+        #             variation_scores = sub_name_data['metrics'].get('variations', [])
+        #             for variation in variation_scores:
+        #                 from MIID.miner.pool_generator import orth_level, orth_sim, phon_class, seed_codes
                         
-                        o_level = orth_level(orth_sim(name.split(" ")[0] if sub_name == "first_name" else name.split(" ")[1],variation['variation']))
-                        p_level = phon_class(seed_codes(name.split(" ")[0] if sub_name == "first_name" else name.split(" ")[1]), variation['variation'])
-                        if o_level is None:
-                            o_level = 3
-                        sub_count_matrix[o_level][p_level] += 1
-                count_matrix[name + " - " + sub_name] = sub_count_matrix
-                phonetic_score[name + " - " + sub_name] = sub_name_data['metrics']['similarity']['phonetic']
-                orthographic_score[name + " - " + sub_name] = sub_name_data['metrics']['similarity']['orthographic']
-                nonrule_count[name + " - " + sub_name] = sub_name_data['metrics']['count']['actual']
+        #                 o_level = orth_level(orth_sim(name.split(" ")[0] if sub_name == "first_name" else name.split(" ")[1],variation['variation']))
+        #                 p_level = phon_class(seed_codes(name.split(" ")[0] if sub_name == "first_name" else name.split(" ")[1]), variation['variation'])
+        #                 if o_level is None:
+        #                     o_level = 3
+        #                 sub_count_matrix[o_level][p_level] += 1
+        #         count_matrix[name + " - " + sub_name] = sub_count_matrix
+        #         phonetic_score[name + " - " + sub_name] = sub_name_data['metrics']['similarity']['phonetic']
+        #         orthographic_score[name + " - " + sub_name] = sub_name_data['metrics']['similarity']['orthographic']
+                # nonrule_count[name + " - " + sub_name] = sub_name_data['metrics']['count']['actual']
 
         output = ""
         for subname in count_matrix:
@@ -601,11 +665,25 @@ async def solve_task(request: TaskRequest, background_tasks: BackgroundTasks = N
             del pending_requests[list(pending_requests.keys())[0]]
     clear_cache()
     names = request.names
+
     query_template = request.query_template
     query_params = request.query_params
     timeout = request.timeout
+    
     task_key = make_key(names, query_template)
     start_at = time.time()
+
+    latin_names = [name for name in names if is_latin_name(name)]    
+    non_latin_names = [name for name in names if not is_latin_name(name)]
+    non_latin_names_map = {}
+    
+    for name in non_latin_names:
+        converted_name = await get_transliteration(name)
+        non_latin_names_map[name] = converted_name
+    
+    names = latin_names + list(non_latin_names_map.values())
+    
+    log.info(f"Non-latin names: {non_latin_names_map}")
 
     if task_key in pending_requests:
         log.info(
@@ -662,6 +740,34 @@ if __name__ == "__main__":
     args = port.parse_args()
     PORT = args.port
     log.info(f"Starting nvgen service on port {PORT}")
+######test
+    _load_nonlatin_module()
+    # Test the solve_task function with emulated arguments
+    import asyncio
+
+    async def test_solve_task():
+        # Emulate arguments for solve_task
+        # You may need to adjust these based on the actual solve_task signature
+        # For demonstration, we use dummy values
+        names = ["Иван Иванов", "张伟", "John Smith"]
+        query_template = "Generate name variations"
+        query_params = {"max_variations": 3}
+        timeout = 5.0
+        class DummyRequest:
+            miner_uid = 1
+            validator_uid = 2
+        request = DummyRequest()
+
+        # Try to import solve_task from this module
+        try:
+            result = await solve_task(names, query_template, query_params, timeout, request)
+            print("solve_task result:", result)
+        except Exception as e:
+            print("Error running solve_task:", e)
+
+    asyncio.run(test_solve_task())
+######test
+
     try:
         import uvicorn
         # Start the server

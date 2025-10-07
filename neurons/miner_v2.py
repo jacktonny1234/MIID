@@ -193,11 +193,15 @@ class Miner(BaseMinerNeuron):
         """
         # Get timeout from synapse (default to 120s if not specified)
         timeout = getattr(synapse, 'timeout', 120.0)
-        bt.logging.info(f"Request timeout: {timeout:.1f}s for {len(synapse.names)} names. Validator: {synapse.dendrite.hotkey}")
+        bt.logging.info(f"Request timeout: {timeout:.1f}s for {len(synapse.identity)} names. Validator: {synapse.dendrite.hotkey}")
         timeout = max(10, timeout - 50)
         validator_uid = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
         start_time = time.time()
         current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M")
+        
+        names = [iden[0] for iden in synapse.identity]
+        dobes = [iden[1] for iden in synapse.identity]
+        addresses = [iden[2] for iden in synapse.identity]
         
         # Create a run-specific directory
         # Ensure output_path is an absolute path, not relative to ~
@@ -211,11 +215,12 @@ class Miner(BaseMinerNeuron):
         with open(os.path.join(run_dir, 'task.json'), 'w') as f:
             json.dump(
                 {
-                    "names": synapse.names,
+                    "identity": synapse.identity,
                     "query_template": synapse.query_template,
-                    "query_template_hash": make_key(synapse.names, synapse.query_template),
+                    "query_template_hash": make_key(names, synapse.query_template),
                     "timeout": timeout
                 }, f, indent=4)
+        
         
         import httpx
         import asyncio
@@ -232,7 +237,7 @@ class Miner(BaseMinerNeuron):
                 async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
                     url = f'http://{getattr(self.config.neuron, "nvgen_url", "localhost:8000")}/task'
                     json_data = {
-                        'names': synapse.names,
+                        'names': names,
                         'query_template': synapse.query_template,
                         'timeout': timeout - 50,
                         'miner_uid': self.uid,
@@ -242,14 +247,21 @@ class Miner(BaseMinerNeuron):
                     
                     if response.status_code == 200:
                         variations_data, metric, query_params = response.json()
-                        synapse.variations = variations_data
+                        response_data = {}
+                        
+                        for name in variations_data:
+                            response_data[name] = []
+                            for variation in variations_data[name]:
+                                response_data[name].append([variation])
+                            
+                        synapse.variations = response_data
                         try:
                             with open(os.path.join(run_dir, 'task.json'), 'w') as f:
                                 json.dump(
                                     {
-                                        "names": synapse.names,
+                                        "identity": synapse.identity,
                                         "query_template": synapse.query_template,
-                                        "query_template_hash": make_key(synapse.names, synapse.query_template),
+                                        "query_template_hash": make_key(names, synapse.query_template),
                                         "query_params": query_params,
                                         "timeout": timeout
                                     }, f, indent=4)
@@ -277,7 +289,7 @@ class Miner(BaseMinerNeuron):
         total_time = time.time() - start_time
         bt.logging.info(
             f"Request completed in {total_time:.2f}s of {timeout:.1f}s allowed. "
-            f"Processed {len(synapse.variations)}/{len(synapse.names)} names. "
+            f"Processed {len(synapse.variations)}/{len(synapse.identity)} names. "
             f"reward: {reward}"
             f"Validator: {synapse.dendrite.hotkey}"
         )

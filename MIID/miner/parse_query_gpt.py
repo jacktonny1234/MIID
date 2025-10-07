@@ -407,6 +407,67 @@ RULE_DESCRIPTIONS = {
 }
 
 
+async def convert_names_to_english(names):
+    prompt = (
+        "Instruction:\n"
+        "You are a multilingual name conversion assistant. Convert each name in the input list from a non-Latin script (e.g., Chinese, Korean, Japanese, Arabic, Cyrillic, Hindi, Thai, etc.) into its English equivalent.\n\n"
+        "Rules:\n"
+        "If a widely accepted English equivalent exists, use that (e.g. \"محمد\" → \"Mohammed\", \"Иван\" → \"Ivan\").\n"
+        "If no direct equivalent exists, use a phonetic transliteration (e.g. \"张伟\" → \"Zhang Wei\").\n"
+        "For East Asian names, switch to Western name order (family name last).\n"
+        "Maintain capitalization (first letter of each name capitalized).\n"
+        "Return only the list of English names in the same order as input.\n"
+        "Do not include explanations — output only the list.\n\n"
+        f"Input:\n{names}\n\nOutput:"
+    )
+    # Call OpenRouter-compatible Chat Completions API via AsyncOpenAI client
+    try:
+        from openai import AsyncOpenAI
+        import os
+        client = AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or "",
+            default_headers={
+                "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost"),
+                "X-Title": os.getenv("OPENROUTER_APP_TITLE", "MIID NVGen Service"),
+            },
+        )
+        response = await client.chat.completions.create(
+            model="openai/gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=256,
+        )
+        output_text = response.choices[0].message.content.strip()
+    except Exception:
+        # Fallback: try legacy openai.ChatCompletion if present
+        try:
+            import openai as _openai
+            output = await _openai.ChatCompletion.acreate(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=256,
+            )
+            output_text = output.choices[0].message.content.strip()
+        except Exception:
+            output_text = str(names)
+    # Extract the list from the response
+    import ast
+    try:
+        english_names = ast.literal_eval(output_text)
+    except Exception:
+        # fallback: try to extract list from string
+        import re
+        match = re.search(r"\[(.*?)\]", output_text, re.DOTALL)
+        if match:
+            items = match.group(1)
+            english_names = [item.strip().strip('"').strip("'") for item in items.split(",")]
+        else:
+            english_names = names  # fallback to original if parsing fails
+    return english_names
+
+
 async def query_parser(query_text: str, max_retries: int = 3) -> Dict[str, Any]:
     api_keys = _get_api_keys()
     client = None
