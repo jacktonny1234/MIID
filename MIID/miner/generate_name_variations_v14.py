@@ -973,3 +973,199 @@ def generate_name_variations(
     best_cand.bucket=best_bucket
     logger.flush()
     return best_cand
+
+def try_once_phonetic_only(
+    original_name: str,
+    first_name: str,
+    last_name: str,
+    name_pools: Dict[str, List[str]],
+    expected_total_count: int,
+    base_count: int,
+    phonetic_similarity: float,
+    query_params: Dict[str, Any],
+    logger: CustomLogger) -> Tuple[Set[str], Set[str]]:
+
+    count_matrix = {}
+
+    for name in [first_name, last_name]:
+        count_matrix[name] = calculate_nonrule_variations_count(
+            name,
+            name_pools[name],
+            base_count,
+            phonetic_similarity,
+            None,
+            [],
+            logger
+        )
+
+    cand = AnswerCandidate(
+        name=original_name,
+        minimal_rule_based_count=0,
+        additional_rule_based_count=0,
+        duplicated_rule_based_count=0,
+        base_count=base_count,
+        effective_rules=[],
+        cand_minrequired_rule_varset=[],
+        additional_rule_varset=[],
+        nonrule_count_matrix=count_matrix,
+        nonrule_name_pools=name_pools,
+        query_params=query_params,
+        scores=0.0,
+        metric={}
+    )
+    responses = {}
+    responses = [SimpleNamespace(
+        variations={original_name: list(cand.get_next_answer())}
+    )]
+    # Calculate rule-based metadata
+    rule_based = {"selected_rules": [], "rule_percentage": 0.0}
+    debug_level = bt.logging.get_level()
+    bt.logging.setLevel('CRITICAL')
+    if (
+        # (phonetic_similarity["Light"] < 0.5 and phonetic_similarity["Medium"] < 0.5 and phonetic_similarity["Far"] < 0.5) or
+        ("Light" in phonetic_similarity and phonetic_similarity["Light"] == 1.0) or
+        # (phonetic_similarity["Medium"] == 1.0) or
+        ("Far" in phonetic_similarity and phonetic_similarity["Far"] == 1.0)
+        ):
+        scores, metric = get_name_variation_rewards(
+            None,
+            seed_names=[original_name], 
+            responses=responses,
+            uids=[0],
+            variation_count=expected_total_count,
+            phonetic_similarity=phonetic_similarity,
+            rule_based=rule_based,
+        )
+    else:
+        scores, metric = get_name_variation_rewards(None,
+            seed_names=[original_name], 
+            responses=responses,
+            uids=[0],
+            variation_count=expected_total_count,
+            phonetic_similarity=phonetic_similarity,
+            rule_based=rule_based,
+            test_purpose=True
+        )
+    bt.logging.setLevel(debug_level)
+    logger.debug(f"scores: {scores}")
+    cand.scores = scores[0]
+    cand.metric = metric[0]
+    return cand
+
+
+def generate_name_variations_phonetic_only(
+    original_name: str,
+    query_params: Dict[str, Any],
+    key: str = None,
+    timeout: int = 100,
+) -> List[str]:
+
+    expected_total_count=int(query_params.get("variation_count") or 0)
+    phonetic_similarity=query_params.get("phonetic_similarity")
+
+    logger = CustomLogger(name=original_name, output_file=f"logs/{key}/{original_name}.log", use_stdout=False)
+    logger.info(f"Generating variations for {original_name}")
+    logger.info(f"-" * 100)
+    
+    # get name parts
+    (first_name, last_name) = get_name_parts(original_name)
+    logger.info(f"First name: {first_name}")
+    logger.info(f"Last name: {last_name}")
+    logger.info(f"-" * 100)
+
+    # get pool of nonrule variations for first and last name
+    try:
+        import concurrent.futures
+        from itertools import repeat
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            tasks = list(executor.map(gen_pool, [first_name, last_name], repeat([]), repeat(logger), repeat(timeout / 3 * 2)))
+            name_pools = {first_name: tasks[0], last_name: tasks[1]}
+    except Exception as e:
+        logger.warning(f"Failed to generate variant pools for {original_name}: {e}")
+        name_pools = None
+        return []
+    
+    # Convert name_pools to remove the orthographic axis (reduce dimension)
+    # Each pool: nonrule_vpools[l_level][o_target][p_level]
+    # We want: [l_level][p_level][variants] (merge all o_target/orthographic levels)
+    def merge_orthographic_axis(pool):
+        # pool: [l_level][o_target][p_level][variants]
+        merged = []
+        for l_level in range(len(pool)):
+            merged_l = []
+            for p_level in range(8):
+                # Collect all variants from all o_target (orthographic) levels for this l/p
+                variants = []
+                for o_target in range(4):
+                    variants.extend(pool[l_level][o_target][p_level])
+                merged_l.append(variants)
+            merged.append(merged_l)
+        return merged
+
+    for k in name_pools:
+        name_pools[k] = merge_orthographic_axis(name_pools[k])
+
+    best_cand = None
+    bucket_cand = {}
+    scores = []
+    
+    cand = try_once_phonetic_only(
+        original_name,
+        first_name,
+        last_name,
+        name_pools,
+        expected_total_count,
+        phonetic_similarity,
+        query_params,
+        logger
+    )
+    # if not best_cand:
+    #     best_cand = cand
+    #     continue
+    
+    logger.debug(f"\n{json.dumps(cand.metric, indent=4)}")
+    # precision from 4->2 : orthographic's minor difference is not significant, instead focus on phonetic similarity
+    fmt4 = f"{cand.scores:.4f}" # 4 decimal places
+    if fmt4 not in bucket_cand:
+        bucket_cand[fmt4] = []
+    bucket_cand[fmt4].append(cand)
+    if fmt4 not in scores:
+        scores.append(fmt4)
+    # if cand.scores - best_cand.scores >= 0.001:
+    #     best_cand = cand
+    scores.sort()
+    best_score = scores[-1]
+    best_bucket = bucket_cand[best_score]
+    logger.debug(f"Best score: {best_score}")
+    logger.debug(f"-" * 100)
+    try:
+        logger.debug(f"Best score achieved: {best_score}")
+        # logger.debug(f"\n{json.dumps(best_bucket, indent=4)}")
+        # logger.debug(f"Best selected: {best_cand.minimal_rule_based_count}/{best_cand.additional_rule_based_count}/{best_cand.duplicated_rule_based_count}/{best_cand.base_count}")
+        # logger.debug(f"Min Required Rule Variation Set: {best_cand.cand_minrequired_rule_varset}")
+        # logger.debug(f"Additional Rule Variation Set: {best_cand.additional_rule_varset}")
+        # logger.debug(f"Metric: \n{json.dumps(best_cand.metric, indent=4)}")
+        # logger.debug(f"-" * 100)
+        # best_bucket.query_params = query_params
+    except Exception as e:
+        pass
+    best_cand = AnswerCandidate(
+        name=original_name,
+        minimal_rule_based_count=0,
+        additional_rule_based_count=0,
+        duplicated_rule_based_count=0,
+        base_count=0,
+        effective_rules=None,
+        cand_minrequired_rule_varset=None,
+        additional_rule_varset=None,
+        nonrule_count_matrix=None,
+        nonrule_name_pools=None,
+        query_params=query_params,
+        scores=0.0,
+        metric=None
+    )
+    # Get the last 3 items from best_bucket
+    best_bucket = best_bucket[-3:]
+    best_cand.bucket=best_bucket
+    logger.flush()
+    return best_cand

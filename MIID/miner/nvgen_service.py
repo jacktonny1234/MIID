@@ -26,6 +26,7 @@ from contextlib import asynccontextmanager
 import re
 import time
 import datetime
+import copy
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -100,12 +101,12 @@ A FastAPI-based service that provides name variants to miners' name variant pool
 """
 
 HOST = "0.0.0.0"
-PORT = 8000
+PORT = 8001
 
 # Global state
 pending_requests: Dict[str, asyncio.Event] = {}
 answer_candidate_cache = {}
-
+map_cache = {}
 # Query parsing system
 query_queue = asyncio.Queue()
 parsed_query_cache = {}
@@ -513,7 +514,7 @@ class AnswerCandidateForNoisy:
         import bittensor as bt
         debug_level = bt.logging.get_level()
         bt.logging.setLevel('WARNING')
-        from MIID.validator.reward import get_name_variation_rewards
+        from MIID.validator.reward_v12 import get_name_variation_rewards
         _, metrics = get_name_variation_rewards(
             None,
             seed_names=list(answers[0].keys()), 
@@ -556,8 +557,9 @@ class AnswerCandidateForNoisy:
                 #     self.answer_list.append(answer)
                 #     self.miner_list.append(miner_uid)
                 #     self.metrics = metrics
-                    break
+                #     break
             metrics = [{}]
+            self.metrics = metrics
             with open(f_serial, "w") as f:
                 f.write(str(self.serial))
             if try_count < 0:
@@ -664,26 +666,14 @@ async def solve_task(request: TaskRequest, background_tasks: BackgroundTasks = N
             del answer_candidate_cache[list(answer_candidate_cache.keys())[0]]
             del pending_requests[list(pending_requests.keys())[0]]
     clear_cache()
-    names = request.names
-
+    names = request.names    
     query_template = request.query_template
     query_params = request.query_params
     timeout = request.timeout
+    non_latin_names_map = {}
     
     task_key = make_key(names, query_template)
     start_at = time.time()
-
-    latin_names = [name for name in names if is_latin_name(name)]    
-    non_latin_names = [name for name in names if not is_latin_name(name)]
-    non_latin_names_map = {}
-    
-    for name in non_latin_names:
-        converted_name = await get_transliteration(name)
-        non_latin_names_map[name] = converted_name
-    
-    names = latin_names + list(non_latin_names_map.values())
-    
-    log.info(f"Non-latin names: {non_latin_names_map}")
 
     if task_key in pending_requests:
         log.info(
@@ -695,21 +685,48 @@ async def solve_task(request: TaskRequest, background_tasks: BackgroundTasks = N
                 f"Miner {request.miner_uid} (validator: {request.validator_uid}, task:{task_key}): "
                 f"Finished waiting pending request hit. Using cached answer candidate for {task_key}")
             answer_candidate = answer_candidate_cache[task_key]
-
+        if task_key in map_cache:
+            non_latin_names_map = map_cache[task_key]
     elif task_key in answer_candidate_cache:
         log.info(
             f"Miner {request.miner_uid} (validator: {request.validator_uid}, task:{task_key}): "
             f"Using cached answer candidate for {task_key}")
         answer_candidate = answer_candidate_cache[task_key]
+        if task_key in map_cache:
+            non_latin_names_map = map_cache[task_key]
     else:
+        latin_names = [name for name in names if is_latin_name(name)]
+        non_latin_names = [name for name in names if not is_latin_name(name)]
+        
+        for name in non_latin_names:
+            converted_name = await get_transliteration(name)
+            non_latin_names_map[name] = converted_name
+        
+        non_latin_names = list(non_latin_names_map.values())
+        
+        log.info(f"Non-latin names: {non_latin_names_map}")
+
         log.info(
             f"Miner {request.miner_uid} (validator: {request.validator_uid}, task:{task_key}): "
             f"Calculate answer candidate for {task_key} with timeout {timeout: .1f}s")
         pending_requests[task_key] = asyncio.Event()
         try:
-            answer_candidate = await calculate_answer_candidate(names, query_template, query_params, timeout)
+            answer_candidate_latin = await calculate_answer_candidate(latin_names, query_template, query_params, timeout)
+            
+            # Make a copy of query_params with rule count set to 0
+            
+            query_params_no_rule = None
+            if query_params is not None:
+                query_params_no_rule = copy.deepcopy(query_params)
+                query_params_no_rule["rule_percentage"] = 0.0
+                query_params_no_rule["selected_rules"] = []
+            
+            answer_candidate_non_latin = await calculate_answer_candidate(non_latin_names, query_template, query_params_no_rule, timeout)
+            answer_candidate = answer_candidate_latin + answer_candidate_non_latin
+            
             answer_candidate = AnswerCandidateForNoisy(task_key, answer_candidate, validator_uid=request.validator_uid, query_template=query_template)
             answer_candidate_cache[task_key] = answer_candidate
+            map_cache[task_key] = non_latin_names_map
             pending_requests[task_key].set()
             log.info(
                 f"Miner {request.miner_uid} (validator: {request.validator_uid}, task:{task_key}): "
@@ -722,6 +739,23 @@ async def solve_task(request: TaskRequest, background_tasks: BackgroundTasks = N
             raise HTTPException(status_code=408, detail="Request timeout waiting for pool generation")
     
     answer, metric = answer_candidate.get_next_answer_for(request.miner_uid)
+    
+    # convert non-latin names back to original names
+    answer_temp = copy.deepcopy(answer)
+    for name in answer:
+        if name in non_latin_names_map.values():
+            key = list(non_latin_names_map.keys())[list(non_latin_names_map.values()).index(name)]
+            answer_temp[key] = answer[name]
+            del answer_temp[name]
+
+    answer = answer_temp
+    
+    log.info(f"non-latin names map: {non_latin_names_map}")
+    log.info(f"names list: {names}")
+    log.info(f"name variation key: {answer.keys()}")
+    missing_names = set(names) - set(answer.keys())
+    log.info(f"missing names: {missing_names}")
+    
     log.info(
         f"Miner {request.miner_uid} (validator: {request.validator_uid}, task:{task_key}): "
         f"Answer candidate: {answer_candidate.serial}, "
@@ -729,7 +763,6 @@ async def solve_task(request: TaskRequest, background_tasks: BackgroundTasks = N
         f"Metric: {metric.get('final_reward', '0')}")
     save_result(answer_candidate, request.miner_uid)
     return {name: list(answer[name]) for name in answer}, metric, answer_candidate.answer_candidates[0].query_params
-
 
 if __name__ == "__main__":
     import argparse
@@ -740,33 +773,6 @@ if __name__ == "__main__":
     args = port.parse_args()
     PORT = args.port
     log.info(f"Starting nvgen service on port {PORT}")
-######test
-    _load_nonlatin_module()
-    # Test the solve_task function with emulated arguments
-    import asyncio
-
-    async def test_solve_task():
-        # Emulate arguments for solve_task
-        # You may need to adjust these based on the actual solve_task signature
-        # For demonstration, we use dummy values
-        names = ["Иван Иванов", "张伟", "John Smith"]
-        query_template = "Generate name variations"
-        query_params = {"max_variations": 3}
-        timeout = 5.0
-        class DummyRequest:
-            miner_uid = 1
-            validator_uid = 2
-        request = DummyRequest()
-
-        # Try to import solve_task from this module
-        try:
-            result = await solve_task(names, query_template, query_params, timeout, request)
-            print("solve_task result:", result)
-        except Exception as e:
-            print("Error running solve_task:", e)
-
-    asyncio.run(test_solve_task())
-######test
 
     try:
         import uvicorn

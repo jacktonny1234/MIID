@@ -4,6 +4,7 @@ import logging
 from typing import Dict, List, Set, Tuple, Any
 from pathlib import Path
 import numpy as np
+import bittensor as bt
 
 
 _LEET_MAP = str.maketrans({
@@ -323,6 +324,11 @@ def detect_cheating_patterns(
             if all_addresses:
                 unique_addresses = set(all_addresses)
                 duplicate_count = len(all_addresses) - len(unique_addresses)
+
+                bt.logging.info(f"All addresses: {all_addresses}")
+                bt.logging.info(f"Unique addresses: {unique_addresses}")
+                bt.logging.info(f"Duplicate count: {duplicate_count}")
+
                 if duplicate_count > 0:
                     # Apply penalty based on duplicate ratio
                     duplicate_ratio = duplicate_count / len(all_addresses)

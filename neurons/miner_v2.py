@@ -56,6 +56,10 @@ import os
 import numpy as np
 from typing import List, Dict, Tuple, Any, Optional
 from tqdm import tqdm
+from MIID.miner.dob_variations import generate_dobes_variations
+import httpx
+import asyncio
+
 
 # Bittensor Miner Template:
 from MIID.protocol import IdentitySynapse
@@ -67,7 +71,8 @@ from bittensor.core.errors import NotVerifiedException
 
 from datetime import datetime
 import json
-from MIID.miner.nvgen_service import make_key
+from MIID.miner.nvgen_service import is_latin_name, make_key
+from MIID.validator.reward import get_name_variation_rewards
 
 class Miner(BaseMinerNeuron):
     """
@@ -126,6 +131,7 @@ class Miner(BaseMinerNeuron):
         bt.logging.info(f"Mining results will be saved to: {self.output_path}")
         # self.axon.verify_fns[IdentitySynapse.__name__] = self._verify_validator_request
         self.output_path = self.config.neuron.full_path
+        bt.logging.info(f"Full path: {self.output_path}")
         bt.logging.info(f"NVGen url: {self.config.neuron.nvgen_url}")
 
     async def _verify_validator_request(self, synapse: IdentitySynapse) -> None:
@@ -172,129 +178,204 @@ class Miner(BaseMinerNeuron):
             f"Verified call from {self.WHITELISTED_VALIDATORS[hotkey]} ({hotkey})"
         )
 
+
     async def forward(self, synapse: IdentitySynapse) -> IdentitySynapse:
-        """
-        Process a name variation request by generating variations for each name.
-        
-        This is the main entry point for the miner's functionality. It:
-        1. Receives a request with names and a query template
-        2. Processes each name through the LLM
-        3. Extracts variations from the LLM responses
-        4. Returns the variations to the validator
-        
-        Each run is assigned a unique timestamp ID and results are saved in a
-        dedicated directory for that run.
-        
-        Args:
-            synapse: The IdentitySynapse containing names and query template
-            
-        Returns:
-            The synapse with variations field populated with name variations
-        """
-        # Get timeout from synapse (default to 120s if not specified)
-        timeout = getattr(synapse, 'timeout', 120.0)
-        bt.logging.info(f"Request timeout: {timeout:.1f}s for {len(synapse.identity)} names. Validator: {synapse.dendrite.hotkey}")
-        timeout = max(10, timeout - 50)
-        validator_uid = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        start_time = time.time()
+        # ----- timing & bookkeeping -----
+        raw_timeout = float(getattr(synapse, "timeout", 120.0))
+        bt.logging.info(
+            f"Request timeout: {raw_timeout:.1f}s for {len(synapse.identity)} names. "
+            f"Validator: {synapse.dendrite.hotkey}"
+        )
+        # Keep a global budget, but allocate per-attempt sub-budgets later
+        overall_budget = max(10.0, raw_timeout - 10.0)  # keep a little headroom
+        started = time.time()
+
+        try:
+            validator_uid = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        except ValueError:
+            validator_uid = -1  # or handle explicitly
+
         current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M")
-        
-        names = [iden[0] for iden in synapse.identity]
-        dobes = [iden[1] for iden in synapse.identity]
-        addresses = [iden[2] for iden in synapse.identity]
-        
-        # Create a run-specific directory
-        # Ensure output_path is an absolute path, not relative to ~
+
+        names   = [iden[0] for iden in synapse.identity]
+        dobes   = [iden[1] for iden in synapse.identity]
+        addrs   = [iden[2] for iden in synapse.identity]
+
+        # ----- run dir -----
         output_path = self.output_path
-        if output_path.startswith('~'):
-            output_path = os.path.expanduser(output_path)
-        else:
-            output_path = os.path.abspath(output_path)
+        output_path = os.path.expanduser(output_path) if output_path.startswith("~") else os.path.abspath(output_path)
         run_dir = os.path.join(output_path, f"validator_{validator_uid}", f"run_{current_datetime}")
         os.makedirs(run_dir, exist_ok=True)
-        with open(os.path.join(run_dir, 'task.json'), 'w') as f:
-            json.dump(
-                {
-                    "identity": synapse.identity,
-                    "query_template": synapse.query_template,
-                    "query_template_hash": make_key(names, synapse.query_template),
-                    "timeout": timeout
-                }, f, indent=4)
-        
-        
-        import httpx
-        import asyncio
-        
+
+        # ----- retry policy -----
         max_retries = 3
-        base_delay = 1.0
-        reward = 0.0
-        for attempt in range(max_retries):
+        base_delay  = 1.0
+
+        service_url = f'http://{getattr(self.config.neuron, "nvgen_url", "localhost:8000")}/task'
+        bt.logging.info(f"Service url: {service_url}")
+
+        response_data = {}  # will fill on success
+
+        for attempt in range(1, max_retries + 1):
+            elapsed = time.time() - started
+            remaining = overall_budget - elapsed
+            if remaining <= 0:
+                raise asyncio.TimeoutError("Overall timeout budget exhausted")
+
+            # keep each attempt within the remaining budget (with a minimum slice)
+            per_attempt_budget = max(5.0, remaining)
+
             try:
-                
-                # Use a shorter timeout for individual requests to allow for retries
-                # request_timeout = min(30, timeout / max_retries)
-                
-                async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-                    url = f'http://{getattr(self.config.neuron, "nvgen_url", "localhost:8000")}/task'
-                    json_data = {
-                        'names': names,
-                        'query_template': synapse.query_template,
-                        'timeout': timeout - 50,
-                        'miner_uid': self.uid,
-                        "validator_uid": validator_uid
+                async with httpx.AsyncClient(timeout=httpx.Timeout(per_attempt_budget - 2)) as client:
+                    payload = {
+                        "names": names,
+                        "query_template": synapse.query_template,
+                        # pass a sane server-side timeout hint; do NOT go negative
+                        "timeout": max(1.0, per_attempt_budget - 2.0),
+                        "miner_uid": self.uid,
+                        "validator_uid": validator_uid,
                     }
-                    response = await client.post(url, json=json_data)
+
+                    # Hard wall for the whole request/response
+                    resp = await asyncio.wait_for(
+                        client.post(service_url, json=payload),
+                        timeout=per_attempt_budget
+                    )
+                    bt.logging.info(f"Payload: {payload}")
+                    bt.logging.info(f"Response: {resp}")
                     
-                    if response.status_code == 200:
-                        variations_data, metric, query_params = response.json()
-                        response_data = {}
-                        
-                        for name in variations_data:
-                            response_data[name] = []
-                            for variation in variations_data[name]:
-                                response_data[name].append([variation])
-                            
-                        synapse.variations = response_data
+                    resp.raise_for_status()
+
+                data = resp.json()
+                try:
+                    name_variations, metric, query_params = data
+                except Exception:
+                    raise ValueError("Unexpected response shape; expected [name_variations, metric, query_params]")
+
+                # Derive DOB variations
+                variation_count = int(query_params.get("variation_count", 10))
+                dob_variations = generate_dobes_variations(dobes, 11)
+
+                bt.logging.info(f"Name variations keys: {name_variations}... total={len(name_variations)}")
+                
+
+                # Build response safely
+                response_data = {}
+                for idx, (name, dob, address) in enumerate(synapse.identity):
+                    # ensure a unique key even for duplicate names
+                    key = f"{name}"
+                    response_data[key] = []
+
+                    variations_for_name = name_variations.get(name, [])
+                    dobs_for_dob = dob_variations.get(dob, [])
+
+                    if not variations_for_name:
+                        bt.logging.warning(f"No name variations for '{name}'")
+                    if not dobs_for_dob:
+                        bt.logging.warning(f"No DOB variations for '{dob}'")
+                    
+                    temp_address = address
+
+                    for j, name_var in enumerate(variations_for_name):
+                        dob_var = dobs_for_dob[j] if j < len(dobs_for_dob) else ""
+                        if dob_var is None:
+                            dob_var = ""  # normalize Nones
+                        import random
+                        import string
+                        rand_letters = ''.join(random.choices(string.ascii_lowercase, k=2))
+                        temp_address = address + rand_letters + str(j)
+                        response_data[key].append([name_var, dob_var, temp_address])
+
+                synapse.variations = response_data
+
+                # Evaluate response_data with reward function and persist metrics
+                if True:
+                    try:
+                        seed_names = names
+                        seed_dob = dobes
+                        seed_addresses = addrs
+                        # Avoid heavy transliteration path during miner-side evaluation
+                        seed_script = ["latin" if is_latin_name(name) else "non-latin" for name in seed_names]
+                        rewards_arr, detailed_metrics = get_name_variation_rewards(
+                            None,
+                            seed_names=seed_names,
+                            seed_dob=seed_dob,
+                            seed_addresses=seed_addresses,
+                            seed_script=seed_script,
+                            responses=[synapse],
+                            uids=[self.uid],
+                            variation_count=variation_count,
+                            phonetic_similarity=query_params.get("phonetic_similarity"),
+                            orthographic_similarity=query_params.get("orthographic_similarity"),
+                            rule_based=query_params,
+                        )
+                        # Save evaluation results
                         try:
-                            with open(os.path.join(run_dir, 'task.json'), 'w') as f:
+                            eval_path = os.path.join(run_dir, "reward_eval.json")
+                            with open(eval_path, "w") as f:
                                 json.dump(
                                     {
-                                        "identity": synapse.identity,
-                                        "query_template": synapse.query_template,
-                                        "query_template_hash": make_key(names, synapse.query_template),
-                                        "query_params": query_params,
-                                        "timeout": timeout
-                                    }, f, indent=4)
-                            with open(os.path.join(run_dir, 'metric.json'), 'w') as f:
-                                json.dump(metric, f, indent=4)
-                            reward = metric["final_reward"]
+                                        "rewards": [float(x) for x in rewards_arr.tolist()],
+                                        "metrics": detailed_metrics,
+                                    },
+                                    f,
+                                    indent=4,
+                                )
                         except Exception as e:
-                            bt.logging.error(f"Error saving task.json: {e}")
-                            pass
-                    else:
-                        bt.logging.warning(f"Service returned status {response.status_code}")
-                        raise httpx.HTTPStatusError(f"HTTP {response.status_code}", request=response.request, response=response)
-            except (httpx.RequestError, httpx.HTTPStatusError, asyncio.TimeoutError) as e:
-                bt.logging.warning(f"Attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    # Exponential backoff with jitter
-                    delay = base_delay * (2 ** attempt) + np.random.uniform(0, 1)
-                    bt.logging.info(f"Waiting {delay:.2f}s before retry...")
-                    await asyncio.sleep(delay)
-                else:
-                    bt.logging.error(f"All {max_retries} attempts failed")
-                    raise e
-            finally:
+                            bt.logging.error(f"Error saving reward_eval.json: {e}")
+                    except Exception as e:
+                        import traceback
+                        bt.logging.error(traceback.format_exc())
+                        bt.logging.error(f"Reward evaluation failed: {e}")
+                
+                # Save artifacts without blocking the loop
+                try:
+                    async def _write_files():
+                        task_path = os.path.join(run_dir, "task.json")
+                        metric_path = os.path.join(run_dir, "metric.json")
+                        task_blob = {
+                            "identity": synapse.identity,
+                            "query_template": synapse.query_template,
+                            "query_template_hash": make_key(names, synapse.query_template),
+                            "query_params": query_params,
+                            "timeout_budget": overall_budget,
+                        }
+                        with open(task_path, "w") as f:
+                            json.dump(task_blob, f, indent=4)
+                        with open(metric_path, "w") as f:
+                            json.dump(metric, f, indent=4)
+
+                    await asyncio.to_thread(asyncio.run, _write_files())  # run sync file writes in a worker thread
+                except Exception as e:
+                    bt.logging.error(f"Error saving artifacts: {e}")
+
+                # success -> break out
                 break
-        total_time = time.time() - start_time
+
+            except Exception as e:
+                bt.logging.warning(f"Attempt {attempt} failed: {e}")
+                if attempt == max_retries:
+                    bt.logging.error("All attempts failed")
+                    raise
+                # jittered backoff
+                delay = base_delay * (2 ** (attempt - 1)) + float(np.random.uniform(0, 1))
+                # ensure we don't exceed remaining budget
+                delay = min(delay, max(0.0, overall_budget - (time.time() - started)))
+                if delay <= 0:
+                    continue
+                bt.logging.info(f"Retrying in {delay:.2f}s...")
+                await asyncio.sleep(delay)
+
+        total_time = time.time() - started
+        processed = len(getattr(synapse, "variations", {}))
         bt.logging.info(
-            f"Request completed in {total_time:.2f}s of {timeout:.1f}s allowed. "
-            f"Processed {len(synapse.variations)}/{len(synapse.identity)} names. "
-            f"reward: {reward}"
+            f"Request completed in {total_time:.2f}s of {overall_budget:.1f}s allowed. "
+            f"Processed {processed}/{len(synapse.identity)} names. "
             f"Validator: {synapse.dendrite.hotkey}"
         )
         return synapse
-    
+
+
     def Get_Respond_LLM(self, prompt: str) -> str:
         """
         Query the LLM using Ollama.

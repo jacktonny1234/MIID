@@ -1860,6 +1860,7 @@ def get_name_variation_rewards(
     
     # Process each miner's response
     for i, (response, uid) in enumerate(zip(responses, uids)):
+        bt.logging.error(f"Processing index {i}")
         #bt.logging.info(f"\n{'='*50}")
         #bt.logging.info(f"Processing miner {uid}")
         
@@ -1898,6 +1899,10 @@ def get_name_variation_rewards(
 
         # Calculate penalty for unexpected names (extra variations)
         invalid_names = set(variations.keys()) - set(seed_names)
+
+        bt.logging.info(f"Seed names: {seed_names}")
+        bt.logging.info(f"Variations: {variations.keys}")
+        bt.logging.info(f"Invalid names: {invalid_names}")
         if invalid_names:
             bt.logging.warning(f"Miner {uid} provided variations for unexpected names: {invalid_names}")
             # 10% penalty per extra name, up to 70% max
@@ -1913,16 +1918,16 @@ def get_name_variation_rewards(
                 continue
             
             # Check if each variation has at least 3 elements (name, dob, address)
-            for i, var in enumerate(vars_list):
+            for idx, var in enumerate(vars_list):
                 if not isinstance(var, (list, tuple)) or len(var) < 3:
-                    bt.logging.warning(f"Miner {uid} provided incomplete variation {i} for {name}: expected [name, dob, address], got {var}")
+                    bt.logging.warning(f"Miner {uid} provided incomplete variation {idx} for {name}: expected [name, dob, address], got {var}")
                     # Pad with empty strings if needed
                     if isinstance(var, (list, tuple)):
                         while len(var) < 3:
                             var.append("")
                     else:
                         # If it's not a list/tuple, replace it with a properly formatted one
-                        vars_list[i] = [str(var) if var else "", "", ""]
+                        vars_list[idx] = [str(var) if var else "", "", ""]
         
         # Penalty for too many variations per name, DOB, and addresses
         for name, vars_list in variations.items():
@@ -2070,6 +2075,13 @@ def get_name_variation_rewards(
         
         # Calculate total penalty and completeness multiplier
         total_penalty = min(0.9, miner_metrics["penalties"]["extra_names"] + miner_metrics["penalties"]["missing_names"] + miner_metrics["penalties"]["insufficient_addresses"] + miner_metrics["penalties"]["insufficient_dob"])
+        
+        bt.logging.info(f"Extra names penalty: {miner_metrics['penalties']['extra_names']}")
+        bt.logging.info(f"Missing names penalty: {miner_metrics['penalties']['missing_names']}")
+        bt.logging.info(f"Insufficient addresses penalty: {miner_metrics['penalties']['insufficient_addresses']}")
+        bt.logging.info(f"Insufficient DOB penalty: {miner_metrics['penalties']['insufficient_dob']}")
+        bt.logging.info(f"Total penalty: {total_penalty}")
+        
         completeness_multiplier = max(0.1, 1.0 - total_penalty)
         miner_metrics["penalties"]["total_penalty"] = float(total_penalty)
         miner_metrics["completeness_multiplier"] = float(completeness_multiplier)
@@ -2219,6 +2231,10 @@ def get_name_variation_rewards(
             
             # Final quality is sum of all components
             final_quality = quality_component + dob_component + address_component
+            
+            bt.logging.info(f"Final quality: {final_quality}")
+            bt.logging.info(f"Completeness multiplier: {completeness_multiplier}")
+            bt.logging.info(f"index: {i}")
             
             rewards[i] = final_quality * completeness_multiplier
             miner_metrics["average_base_score"] = float(avg_base_score)
